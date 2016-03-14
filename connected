@@ -1,0 +1,228 @@
+#!/bin/bash
+# Connected
+#
+# Copyright Tarim 2016
+#
+# Connected is free software: you can redistribute it and/or modify
+# it under the terms of the GNU Lesser General Public License as published by
+# the Free Software Foundation, either version 3 of the License, or
+# (at your option) any later version.
+#
+# Connected is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU Lesser General Public License
+# along with Connected.  If not, see <http://www.gnu.org/licenses/>.
+
+# Connect to a command such as nc, telnet, ssh using bash line editing
+
+
+
+# Used by SSH_ASKPASS; if SSH_PASSWORD is exported then echo and exit
+[ -n "${SSH_PASSWORD}" ] && {
+    echo "${SSH_PASSWORD}"
+    exit 0
+}
+
+
+
+# Globals
+HISTFILE="${HOME}/.connected_history"
+Esc="~"
+
+Pipe="/tmp/connected$$.fifo"
+Setsid="setsid"  # cheap way to drop the controlling tty
+
+
+
+# Usage
+[ "$#" = 0 ] && {
+    echo -n "\
+Usage: $(basename $0) [-esc ESCAPE_CHAR] [-hist HISTORY_FILE] [-int] [-debug] CONNECT_CMD
+
+-esc    set escape character for escape commands:
+          ${Esc}e  turn off echo
+          ${Esc}q  quit
+          ${Esc}r  raw mode; exit with ${Esc}<ctrl-J>.
+          ${Esc}X  send <ctrl-X> (or other control characters)
+          ${Esc}${Esc}...  strip leading ${Esc}
+-hist   set history file (default is ~/.connected_history)
+-int    allow interrupts (ctrl-C) to be passed through
+-debug  print debug messages
+" >&2
+    exit 0
+}
+
+
+
+# Parse switches
+while :; do
+    case "$1" in
+    -esc)
+        shift
+        Esc="$1"
+        shift
+        ;;
+
+    -int)
+        TrapInt=1
+        NoTTY="${Setsid}"
+        shift
+        ;;
+
+    -hist)
+        shift
+        HISTFILE="$1"
+        shift
+        ;;
+
+    -debug)
+        Debug=1
+        shift
+        ;;
+
+    ssh)
+        # ssh will use SSH_ASKPASS if it has a DISPLAY and no controlling tty
+        # use this script as SSH_ASKPASS program when SSH_PASSWORD exported
+        export SSH_ASKPASS="$0"
+        [ -n "${DISPLAY}" ] || {
+            export DISPLAY="dummy:0.0"
+        }
+        export SSH_PASSWORD
+
+        read -sp "Password: " SSH_PASSWORD
+        echo ""
+
+        NoTTY="${Setsid}"
+        break
+        ;;
+
+    *)
+        break
+        ;;
+    esac
+done
+
+
+
+# Print debug messages
+debug() {
+    [ -n "${Debug}" ] && {
+        echo "$@" >&2
+    }
+}
+
+
+# Cleanup handler
+cleanup() {
+    debug "Cleanup"
+    history -w
+    rm -f "${Pipe}"
+    pkill -P $$
+    exit ${1:-1}
+}
+
+
+# Check connection still active
+ckconnect() {
+    ps ${ConnectPID} >/dev/null || {
+        echo "Remote connection closed" >&2
+        cleanup 0
+    }
+}
+
+
+
+# Set cleanup handler
+history -r
+debug "Set cleanup"
+trap cleanup SIGINT SIGHUP SIGQUIT SIGABRT SIGKILL SIGTERM
+
+
+# Create pipe and keep it open
+debug "Make pipe"
+rm -f "${Pipe}"
+mkfifo "${Pipe}"
+sleep 999999 > "${Pipe}" &
+
+
+# Run the connect command
+debug "Run connect: ${NoTTY} $@"
+${NoTTY} "$@" < "${Pipe}" &
+ConnectPID=$!
+ckconnect
+
+
+# Trap interrupts and send ctrl-C if TrapInt set
+interrupt() {
+    debug "Trapped interrupt"
+    ckconnect
+    echo -ne "\003" > "${Pipe}"
+}
+[ -n "${TrapInt}" ] && {
+    debug "Set interrupt"
+    trap interrupt SIGINT
+}
+
+
+# Would this work if it was in the .inputrc file?
+# bind set disable-completion On
+
+
+
+# Main read loop
+debug "Enter read loop"
+while read -er Line; do
+    ckconnect
+    case "${Line}" in
+
+    # Echo off; don't record in history
+    ${Esc}e)
+        debug "Echo off"
+        read -ers Line
+        ckconnect
+        echo "${Line}" > "${Pipe}"
+        ;;
+
+    # Quit loop and cleanup
+    ${Esc}q)
+        break
+        ;;
+
+    # Raw mode
+    ${Esc}r)
+        debug "Entering raw mode"
+        stty raw -echo -echoe -echok -echoctl -echoke
+
+        # sed quits when it sees escape char at end of line
+        # pipeline takes an extra character to die
+        tee -a ${Pipe} | sed -un "/${Esc}"'$/Q'
+
+        stty sane
+        ckconnect
+        echo "Exiting raw mode" >&2
+        ;;
+
+    # Send corresponding control character
+    ${Esc}[A-Z@\[\\\]_^])
+        echo -n "${Line#${Esc}}" | tr '@-_' '\000-\037' > "${Pipe}"
+        ;;
+
+    # Strip leading escape character
+    ${Esc}${Esc}*)
+        echo "${Line#${Esc}}" > "${Pipe}"
+        history -s "${Line}"
+        ;;
+
+    # Send line
+    *)
+        echo "${Line}" > "${Pipe}"
+        history -s "${Line}"
+        ;;
+    esac
+done
+
+debug "Exit read loop"
+cleanup 0
