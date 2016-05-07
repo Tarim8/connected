@@ -16,7 +16,10 @@
 # You should have received a copy of the GNU Lesser General Public License
 # along with Connected.  If not, see <http://www.gnu.org/licenses/>.
 
-# Connect to a command such as nc, telnet, ssh using bash line editing
+# Connect to a command such as nc, telnet, ssh using bash style line editing
+# and history.
+
+Version="1.1"
 
 
 
@@ -31,27 +34,34 @@
 # Globals
 HISTFILE="${HOME}/.connected_history"
 Esc="~"
+Signals="SIGINT SIGHUP SIGQUIT SIGABRT SIGKILL SIGTERM"
 
-Pipe="/tmp/connected$$.fifo"
-Setsid="setsid"  # cheap way to drop the controlling tty
+command -v setsid >/dev/null 2>&1 && {
+    Setsid="setsid"  # cheap way to drop the controlling tty
+}
 
 
 
 # Usage
-[ "$#" = 0 ] && {
+usage() {
     echo -n "\
-Usage: $(basename $0) [-esc ESCAPE_CHAR] [-hist HISTORY_FILE] [-int] [-debug] CONNECT_CMD
+Usage: $(basename $0) [-esc ESCAPE_CHAR] [-hist HISTORY_FILE] [-intr] [-debug] CONNECT_CMD
+-esc       set escape character for escape commands
+-hist      set history file (default is ~/.connected_history)
+-intr      allow interrupt character to be passed through immediately
+-debug     print debug messages
+-version   print version and exit
 
--esc    set escape character for escape commands:
-          ${Esc}e  turn off echo
-          ${Esc}q  quit
-          ${Esc}r  raw mode; exit with ${Esc}<ctrl-J>.
-          ${Esc}X  send <ctrl-X> (or other control characters)
-          ${Esc}${Esc}...  strip leading ${Esc}
--hist   set history file (default is ~/.connected_history)
--int    allow interrupts (ctrl-C) to be passed through
--debug  print debug messages
+Commands at beginning of line:
+${Esc}e         turn off echo
+${Esc}r         enter raw mode
+${Esc}{ctrl-J}  exit raw mode (send anywhere in line)
+${Esc}X         send {ctrl-X} (or other control characters)
+${Esc}${Esc}...      strip leading ${Esc}
+${Esc}q         quit
+{ctrl-D}   quit (eof character)
 " >&2
+
     exit 0
 }
 
@@ -60,27 +70,41 @@ Usage: $(basename $0) [-esc ESCAPE_CHAR] [-hist HISTORY_FILE] [-int] [-debug] CO
 # Parse switches
 while :; do
     case "$1" in
-    -esc)
+    -esc | --esc)
         shift
         Esc="$1"
         shift
         ;;
 
-    -int)
-        TrapInt=1
+    -intr | --intr | -int | --int)
+        IntrChr="$( stty -a | sed -n 's/.*intr = ^\(.\).*/\1/p' )"
         NoTTY="${Setsid}"
         shift
         ;;
 
-    -hist)
+    -hist | --hist)
         shift
         HISTFILE="$1"
         shift
         ;;
 
-    -debug)
+    -debug | --debug)
         Debug=1
         shift
+        ;;
+
+    -version | --version | -v)
+        echo "$(basename $0): Version ${Version}"
+        exit 0
+        ;;
+
+    --)
+        shift
+        break
+        ;;
+
+    -*)
+        usage
         ;;
 
     ssh)
@@ -105,6 +129,10 @@ while :; do
     esac
 done
 
+[ "$#" = 0 ] && {
+    usage
+}
+
 
 
 # Print debug messages
@@ -118,19 +146,76 @@ debug() {
 # Cleanup handler
 cleanup() {
     debug "Cleanup"
+
+    trap cleanconnect ${Signals}
+
     history -w
-    rm -f "${Pipe}"
-    pkill -P $$
+    exec 3>&-
+    rm -f "${Pipe}" "${TeePipe}"
+
+    wait "${ConnectPID}"
+
+    cleanconnect
     exit ${1:-1}
+}
+
+
+# Cleanup connect commmand
+cleanconnect() {
+    trap - ${Signals}
+    pkill -P $$
+}
+
+
+# Trap interrupts and send interrupt character (ctrl-C)
+interrupt() {
+    debug "Interrupt"
+    ckconnect
+    sendctrl "${IntrChr}"
+}
+
+
+# Make a temporary pipe
+mkpipe() {
+    local Name="/tmp/$(basename $0)-${1:-cmd}-$$.pipe"
+    debug "Make pipe ${Name}"
+    rm -f "${Name}"
+    mkfifo "${Name}"
+    echo "${Name}"
 }
 
 
 # Check connection still active
 ckconnect() {
-    ps ${ConnectPID} >/dev/null || {
+    ps -p "${ConnectPID}" >/dev/null 2>&1 || {
         echo "Remote connection closed" >&2
         cleanup 0
     }
+}
+
+
+# Send argument to connect command
+sendline() {
+    case "${1}" in   
+    -*)
+        echo "X${1}" | sed 's/^X//' >&3
+        ;;
+    *)
+        echo "${1}" >&3
+        ;;
+    esac
+}
+
+
+# Send control character to connect command
+sendctrl() {
+    echo -n "${1}" | tr '@-_' '\000-\037' >&3
+}
+
+
+# Add argument to history
+addhistory() {
+    history -s -- "${1}"
 }
 
 
@@ -138,38 +223,29 @@ ckconnect() {
 # Set cleanup handler
 history -r
 debug "Set cleanup"
-trap cleanup SIGINT SIGHUP SIGQUIT SIGABRT SIGKILL SIGTERM
+trap cleanup ${Signals}
 
+# Create pipes
+Pipe="$(mkpipe)"
+TeePipe="$(mkpipe tee)"
 
-# Create pipe and keep it open
-debug "Make pipe"
-rm -f "${Pipe}"
-mkfifo "${Pipe}"
-sleep 999999 > "${Pipe}" &
-
-
-# Run the connect command
-debug "Run connect: ${NoTTY} $@"
+# Run the connect command and redirect stream 3 to it
+debug "Run: ${NoTTY} $@"
 ${NoTTY} "$@" < "${Pipe}" &
 ConnectPID=$!
-ckconnect
+exec 3>"${Pipe}"
 
-
-# Trap interrupts and send ctrl-C if TrapInt set
-interrupt() {
-    debug "Trapped interrupt"
-    ckconnect
-    echo -ne "\003" > "${Pipe}"
-}
-[ -n "${TrapInt}" ] && {
-    debug "Set interrupt"
+# Interrupt handler if IntrChr set
+[ -n "${IntrChr}" ] && {
+    debug "Set handler {ctrl-${IntrChr}}"
     trap interrupt SIGINT
 }
-
 
 # Would this work if it was in the .inputrc file?
 # bind set disable-completion On
 
+# Check it's running (unimportant race hazard here)
+ckconnect
 
 
 # Main read loop
@@ -183,7 +259,7 @@ while read -er Line; do
         debug "Echo off"
         read -ers Line
         ckconnect
-        echo "${Line}" > "${Pipe}"
+        sendline "${Line}"
         ;;
 
     # Quit loop and cleanup
@@ -193,33 +269,37 @@ while read -er Line; do
 
     # Raw mode
     ${Esc}r)
-        debug "Entering raw mode"
+        debug "Enter raw mode"
+
+        SttyModes="$(stty -g)"
         stty raw -echo -echoe -echok -echoctl -echoke
 
-        # sed quits when it sees escape char at end of line
-        # pipeline takes an extra character to die
-        tee -a ${Pipe} | sed -un "/${Esc}"'$/Q'
+        tee "${TeePipe}" >&3 <&0 &
+        TeePID=$!
+        # grep quits when it sees escape char followed by ctrl-J (end of line)
+        grep -q "${Esc}"'$' < "${TeePipe}"
 
-        stty sane
+        kill "${TeePID}" >/dev/null 2>&1
+        stty "${SttyModes}"
+        debug "Exit raw mode"
         ckconnect
-        echo "Exiting raw mode" >&2
         ;;
 
     # Send corresponding control character
     ${Esc}[A-Z@\[\\\]_^])
-        echo -n "${Line#${Esc}}" | tr '@-_' '\000-\037' > "${Pipe}"
+        sendctrl "${Line#${Esc}}"
         ;;
 
     # Strip leading escape character
     ${Esc}${Esc}*)
-        echo "${Line#${Esc}}" > "${Pipe}"
-        history -s "${Line}"
+        sendline "${Line#${Esc}}"
+        addhistory "${Line}"
         ;;
 
-    # Send line
+    # Send line as is
     *)
-        echo "${Line}" > "${Pipe}"
-        history -s "${Line}"
+        sendline "${Line}"
+        addhistory "${Line}"
         ;;
     esac
 done
