@@ -19,12 +19,12 @@
 # Connect to a command such as nc, telnet, ssh using bash style line editing
 # and history.
 
-Version="1.1"
+Version="1.2"
 
 
 
-# Used by SSH_ASKPASS; if SSH_PASSWORD is exported then echo and exit
-[ -n "${SSH_PASSWORD}" ] && {
+# Used by SSH_ASKPASS; if SSH_ECHO is exported then echo SSH_PASSWORD and exit
+[ -n "${SSH_ECHO}" ] && {
     echo "${SSH_PASSWORD}"
     exit 0
 }
@@ -36,20 +36,20 @@ HISTFILE="${HOME}/.connected_history"
 Esc="~"
 Signals="SIGINT SIGHUP SIGQUIT SIGABRT SIGKILL SIGTERM"
 
-command -v setsid >/dev/null 2>&1 && {
-    Setsid="setsid"  # cheap way to drop the controlling tty
-}
-
 
 
 # Usage
 usage() {
     echo -n "\
-Usage: $(basename $0) [-esc ESCAPE_CHAR] [-hist HISTORY_FILE] [-intr] [-debug] CONNECT_CMD
+Usage: $(basename $0) [-esc ESCAPE_CHAR] [-hist HISTORY_FILE] [-intr] [-askpass PASSWORD_PROGRAM] [-passfile PASSWORD_FILE] [-password PASSWORD] [-debug] [-notty NOTTY_PROGRAM] CONNECT_CMD
 -esc       set escape character for escape commands
 -hist      set history file (default is ~/.connected_history)
 -intr      allow interrupt character to be passed through immediately
+-askpass   set program for ssh to ask for passwords (try ssh-askpass)
+-passfile  set a file to read the ssh password from
+-password  set a password for ssh (not recommended)
 -debug     print debug messages
+-notty     set a program to disconnect the controlling tty (notty or setsid)
 -version   print version and exit
 
 Commands at beginning of line:
@@ -67,6 +67,15 @@ ${Esc}q         quit
 
 
 
+# Try commands to drop the controlling TTY
+for Cmd in notty $(dirname $(which "$0"))/notty setsid; do
+    command -v "${Cmd% *}" >/dev/null 2>&1 && {
+        NoTTYCmd="${Cmd}"
+        break
+    }
+done
+
+
 # Parse switches
 while :; do
     case "$1" in
@@ -78,7 +87,6 @@ while :; do
 
     -intr | --intr | -int | --int)
         IntrChr="$( stty -a | sed -n 's/.*intr = ^\(.\).*/\1/p' )"
-        NoTTY="${Setsid}"
         shift
         ;;
 
@@ -94,8 +102,34 @@ while :; do
         ;;
 
     -version | --version | -v)
-        echo "$(basename $0): Version ${Version}"
+        echo $(basename "$0"): Version ${Version}
         exit 0
+        ;;
+
+    -password | --password)
+        shift
+        SSH_PASSWORD="$1"
+        shift
+        ;;
+
+    -passfile | --passfile)
+        shift
+        SSH_PASSWORD=$( cat "$1" ) || {
+            exit 1
+        }
+        shift
+        ;;
+
+    -askpass | --askpass)
+        shift
+        SSH_ASKPASS="$1"
+        shift
+        ;;
+
+    -notty | --notty)
+        shift
+        NoTTYCmd="$1"
+        shift
         ;;
 
     --)
@@ -109,17 +143,35 @@ while :; do
 
     ssh)
         # ssh will use SSH_ASKPASS if it has a DISPLAY and no controlling tty
-        # use this script as SSH_ASKPASS program when SSH_PASSWORD exported
-        export SSH_ASKPASS="$0"
-        [ -n "${DISPLAY}" ] || {
-            export DISPLAY="dummy:0.0"
+        # use this script as SSH_ASKPASS program when SSH_ECHO exported
+
+        [ -n "${SSH_ASKPASS}" ] || {
+            export SSH_ECHO=1
+            SSH_ASKPASS="$0"
+
+            [ -n "${SSH_PASSWORD}" ] || {
+                if [ -t 0 ]; then
+                    read -sp "Password: " SSH_PASSWORD
+                    echo ""
+                else
+                    read -s SSH_PASSWORD
+                fi
+            }
+            export SSH_PASSWORD
         }
-        export SSH_PASSWORD
+        export SSH_ASKPASS
 
-        read -sp "Password: " SSH_PASSWORD
-        echo ""
+        [ -n "${DISPLAY}" ] || {
+            DISPLAY="dummy:0.0"
+        }
+        export DISPLAY
 
-        NoTTY="${Setsid}"
+        NoTTY="${NoTTYCmd}"
+        break
+        ;;
+
+    telnet)
+        NoTTY="${NoTTYCmd}"
         break
         ;;
 
@@ -196,12 +248,12 @@ ckconnect() {
 
 # Send argument to connect command
 sendline() {
-    case "${1}" in   
+    case "$1" in   
     -*)
-        echo "X${1}" | sed 's/^X//' >&3
+        echo "X$1" | sed 's/^X//' >&3
         ;;
     *)
-        echo "${1}" >&3
+        echo "$1" >&3
         ;;
     esac
 }
@@ -209,13 +261,13 @@ sendline() {
 
 # Send control character to connect command
 sendctrl() {
-    echo -n "${1}" | tr '@-_' '\000-\037' >&3
+    echo -n "$1" | tr '@-_' '\000-\037' >&3
 }
 
 
 # Add argument to history
 addhistory() {
-    history -s -- "${1}"
+    history -s -- "$1"
 }
 
 
@@ -248,11 +300,20 @@ exec 3>"${Pipe}"
 ckconnect
 
 
+# If no tty then don't edit line by line
+[ -t 0 ] || {
+    debug "Passthro"
+    cat >&3
+    Code="$?"
+    debug "Done"
+    cleanup "${Code}"
+}
+
 # Main read loop
 debug "Enter read loop"
 while read -er Line; do
     ckconnect
-    case "${Line}" in
+    case "${Esc:+${Line}}" in
 
     # Echo off; don't record in history
     ${Esc}e)
